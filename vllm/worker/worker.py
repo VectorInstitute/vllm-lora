@@ -1,6 +1,8 @@
 """A GPU worker class."""
+import logging
 import os
 from typing import Dict, List, Tuple, Optional
+import re
 
 import torch
 import torch.distributed
@@ -14,6 +16,11 @@ from vllm.sampling_params import SamplingParams
 from vllm.sequence import SequenceData, SequenceGroupMetadata, SequenceOutputs
 from vllm.worker.cache_engine import CacheEngine
 from vllm.utils import get_gpu_memory
+
+logger = logging.getLogger(__name__)
+QKV_PATTERN = re.compile(r"\.(q_proj|k_proj|v_proj)\.")
+GATE_UP_PATTERN = re.compile(r"\.(gate_proj|up_proj)\.")
+QKV_OFFSET_MULTIPLIER_MAP = {"q_proj": 0, "k_proj": 1, "v_proj": 2}
 
 
 class Worker:
@@ -46,6 +53,9 @@ class Worker:
         self.cache_events = None
         self.gpu_cache = None
 
+        # For restoring original parameters w = w_lora - b @ a
+        self.current_lora_adapters = None
+
     def init_model(self):
         # This env var set by Ray causes exceptions with graph building.
         os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
@@ -65,6 +75,31 @@ class Worker:
         # Initialize the model.
         set_random_seed(self.model_config.seed)
         self.model = get_model(self.model_config)
+
+    def apply_lora(self, lora_adapters: Optional[Dict] = None):
+        """
+        Apply new LoRA adapters after reverting any current ones.
+
+        Set lora_adapters to None to revert to base weights.
+        """
+
+        # If LoRA adapters have previously been applied,
+        # subtract these from the current model parameters
+        # before applying the new ones.
+        named_model_parameters = dict(self.model.named_parameters())
+
+        if self.current_lora_adapters is not None:
+            _apply_adapters(
+                named_model_parameters,
+                self.current_lora_adapters,
+                inverted=True,
+            )
+
+        if lora_adapters is not None:
+            self.current_lora_adapters = lora_adapters
+
+            # Replace self.current_lora_adapters with the new lora_adapters.
+            _apply_adapters(named_model_parameters, self.current_lora_adapters)
 
     @torch.inference_mode()
     def profile_num_available_blocks(
@@ -337,3 +372,124 @@ def _pad_to_alignment(x: List[int], multiple_of: int) -> List[int]:
 
 def _pad_to_max(x: List[int], max_len: int) -> List[int]:
     return x + [0] * (max_len - len(x))
+
+
+@torch.inference_mode()
+def _apply_adapters(
+    base_named_params: Dict[str, torch.nn.Parameter],
+    adapter_weights: Dict[str, Optional[Tuple[torch.Tensor, ...]]],
+    inverted: bool = False,
+):
+    """
+    Apply adapters to base_params.
+
+    Params:
+        base_params: base parameter state_dict.
+        adapter_weights: contains a subset of state_dict keys.
+            Each entry is either None (no modification),
+            a tuple of length 1 (directly add to the base array)
+            a tuple of length 2 (a, b_scaled)
+                Add (b_scaled @ a) to the base array), or
+            a tuple of length 3
+                ((a, b_scaled, (n_heads, dim // n_heads // 2, 2, dim)))
+                for sliced rotary weights- needs to be "permuted" before adding:
+                w_updated = w + (
+                    (b_scaled @ a).view(n_heads, dim // n_heads // 2, 2, dim)
+                    .transpose(1, 2)
+                    .reshape(dim, dim)
+                )
+        inverted: subtract adapter weights from base parameters instead of adding;
+            useful for restoring original base parameters.
+
+    See chat.openai.com/share/458a8036-fd3c-491b-951a-6f3e186872d5
+    """
+    # Expand the adapters, one key at a time.
+    device = next(iter(base_named_params.values())).device
+    for key, adapter in adapter_weights.items():
+        if (adapter is None) or ("rotary_emb.inv_freq" in key):
+            continue
+
+        if len(adapter) == 1:
+            w_diff = adapter[0]
+
+        # If an adapter tuple requires expansion (tuple length >= 2)
+        # expand to obtain the full diff matrix.
+        else:
+            assert len(adapter) >= 2
+            a = adapter[0].to(device)
+            b_scaled = adapter[1].to(device)
+            w_diff = b_scaled @ a
+
+            # If a key requires transposing (tuple length is 3),
+            # apply transposing to the LoRA product b_scaled @ a
+            # to the expanded LoRA product.
+            if len(adapter) == 3:
+                view_config = adapter[-1].tolist()
+                dim = view_config[-1]
+
+                w_diff = w_diff.view(*view_config).transpose(1, 2).reshape(dim, dim)
+
+        if inverted:
+            w_diff = (-1) * w_diff
+
+        # vLLM groups attention q, k, and v matrices into a combined "qkv" matrix.
+        # Below are steps to apply adapter diff arrays to this combined matrix.
+        # See load_weights method in vllm_patched/model_executor/models/llama.py.
+        if QKV_PATTERN.search(key) is not None:
+            # Find row offset multiplier in the "qkv" matrix
+            match = QKV_PATTERN.search(key).group(1)
+            offset_multiplier = QKV_OFFSET_MULTIPLIER_MAP.get(match)
+
+            assert (
+                offset_multiplier is not None
+            ), "match isn't in offset map: {}".format(match)
+
+            # Obtain a slice of the "qkv" matrix
+            offset_0 = offset_multiplier * w_diff.shape[0]
+            offset_1 = (offset_multiplier + 1) * w_diff.shape[0]
+            qkv_param_key = key.replace(match, "qkv_proj")
+            param = base_named_params[qkv_param_key]
+            param_slice = param.data[offset_0:offset_1]
+
+            # Add diff array to the slice matrix instead of the full matrix.
+            param_slice.add_(w_diff)
+            logger.debug(
+                "key: {}; param.shape: {}; w_diff.shape: {}".format(
+                    key, param.shape, w_diff.shape
+                )
+            )
+
+        elif GATE_UP_PATTERN.search(key) is not None:
+            for stride_id, weight_name in enumerate(["gate_proj", "up_proj"]):
+                if weight_name not in key:
+                    continue
+                param = base_named_params[key.replace(weight_name, "gate_up_proj")]
+                shard_size = param.shape[0] // 2
+                tensor_model_parallel_rank = 0  # Revise to add support for multi-GPU
+                w_diff = w_diff[
+                    shard_size
+                    * tensor_model_parallel_rank : shard_size
+                    * (tensor_model_parallel_rank + 1)
+                ]
+                param_slice = param.data[
+                    shard_size * stride_id : shard_size * (stride_id + 1)
+                ]
+                assert param_slice.shape == w_diff.shape
+
+                param_slice.add_(w_diff)
+                logger.debug(
+                    "key: {}; param.shape: {}; w_diff.shape: {}".format(
+                        key, param.shape, w_diff.shape
+                    )
+                )
+
+        else:
+            assert key in base_named_params.keys(), (
+                "adapter key not found in base_params.keys(): {} "
+                "(adapter shapes: {})".format(
+                    key, [str(member.shape) for member in adapter]
+                )
+            )
+
+            # Add the expanded LoRA product to the weight matrix.
+            base_named_params[key].data.add_(w_diff)

@@ -4,8 +4,10 @@
 import argparse
 import asyncio
 from http import HTTPStatus
+import io
 import json
 import time
+import tempfile
 from typing import AsyncGenerator, Dict, List, Optional
 from packaging import version
 
@@ -14,6 +16,7 @@ from fastapi import BackgroundTasks, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+import torch
 import uvicorn
 
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -141,6 +144,20 @@ async def show_available_models():
                   permission=[ModelPermission()])
     ]
     return ModelList(data=model_cards)
+
+@app.post("/v1/update-lora")
+async def update_lora(request: Request):
+    # Load LoRA adapter bytes into Torch state_dict
+
+    data = await request.body()
+    buffer = io.BytesIO(data)
+    lora_adapter = torch.load(buffer)
+
+    engine.engine.workers[0].apply_lora(lora_adapter)
+    # for engine.engine.scheduler.
+
+    # Do something with the data
+    return {"status": "success"}
 
 
 def create_logprobs(token_ids: List[int],
