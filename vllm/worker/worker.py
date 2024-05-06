@@ -103,11 +103,14 @@ class Worker(WorkerBase):
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
         # Initialize the distributed environment.
+        print(f"rank {self.rank}: init_worker_distributed_environment")
         init_worker_distributed_environment(self.parallel_config, self.rank,
                                             self.distributed_init_method,
                                             self.local_rank)
+        print(f"rank {self.rank}: init_worker_distributed_environment completed")
         # Set random seed.
         set_random_seed(self.model_config.seed)
+        print(f"rank {self.rank}: set_random_seed completed")
 
     def load_model(self):
         self.model_runner.load_model()
@@ -223,14 +226,18 @@ class Worker(WorkerBase):
                 "blocks_to_swap_out": blocks_to_swap_out,
                 "blocks_to_copy": blocks_to_copy,
             }
+            print("data", data)
             broadcast_tensor_dict(data, src=0)
+            print("data (broadcasted)", data)
         else:
             data = broadcast_tensor_dict(src=0)
+            print("data (broadcasted)", data)
             num_seq_groups = data["num_seq_groups"]
             blocks_to_swap_in = data["blocks_to_swap_in"]
             blocks_to_swap_out = data["blocks_to_swap_out"]
             blocks_to_copy = data["blocks_to_copy"]
 
+        print(f"data (rank {self.rank})", data)
         self.cache_swap(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy)
 
         # If there is no input, we don't need to execute the model.

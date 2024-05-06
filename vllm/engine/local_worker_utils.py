@@ -58,6 +58,7 @@ class ResultFuture(threading.Event, Generic[T]):
 def _set_future_result(future: Union[ResultFuture, asyncio.Future],
                        result: Result):
     if isinstance(future, ResultFuture):
+        print("_set_future_result ResultFuture")
         future.set_result(result)
         return
     loop = future.get_loop()
@@ -78,7 +79,9 @@ class ResultHandler(threading.Thread):
     def run(self):
         for result in iter(self.result_queue.get, _TERMINATE):
             future = self.tasks.pop(result.task_id)
+            print(f"future {result.task_id}: _set_future_result")
             _set_future_result(future, result)
+            print(f"future {result.task_id}: finished")
         # Ensure that all waiters will receive an exception
         for future in self.tasks.values():
             _set_future_result(
@@ -196,6 +199,7 @@ class LocalWorkerVllm(mp.Process):
                 output = None
                 exception = None
                 task_id, method, args, kwargs = items
+                print(f"rank {self.worker.rank}: {method} ({task_id}) started")
                 try:
                     executor = getattr(self.worker, method)
                     output = executor(*args, **kwargs)
@@ -205,6 +209,8 @@ class LocalWorkerVllm(mp.Process):
                         f"Exception in worker {mp.current_process().name} "
                         f"while processing method {method}: {e}, {tb}")
                     exception = e
+                
+                print(f"rank {self.worker.rank}: {method} ({task_id}) finished")
                 self.result_queue.put(
                     Result(task_id=task_id, value=output, exception=exception))
         except KeyboardInterrupt:

@@ -94,6 +94,8 @@ class MultiProcGPUExecutor(MultiGPUExecutor):
             raise NotImplementedError(
                 "max_concurrent_workers is not supported yet.")
 
+        print(f"executor _run_workers: {method} started")
+
         # Start the workers first.
         worker_outputs = [
             worker.execute_method(method, *args, **kwargs)
@@ -111,8 +113,11 @@ class MultiProcGPUExecutor(MultiGPUExecutor):
                                                     **driver_kwargs)
 
         # Get the results of the workers.
-        return [driver_worker_output
+        output = [driver_worker_output
                 ] + [output.get() for output in worker_outputs]
+
+        print(f"executor _run_workers: {method} finished")
+        return output
 
     def check_health(self) -> None:
         """Raises an error if engine is unhealthy."""

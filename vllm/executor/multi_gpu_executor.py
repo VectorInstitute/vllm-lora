@@ -34,10 +34,14 @@ class MultiGPUExecutor(ExecutorBase):
             is_driver_worker=True,
         )
 
+        print("executor: init_device started")
         self._run_workers("init_device")
+        print("executor: init_device completed")
+        print("executor: load_model started")
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
                           max_parallel_loading_workers)
+        print("executor: load_model completed")
 
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks.
